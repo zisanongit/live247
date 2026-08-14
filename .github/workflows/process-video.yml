@@ -17,10 +17,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           python3 -m pip install --upgrade pip
-          python3 -m pip install b2
+          python3 -m pip install --upgrade b2
 
-      - name: Show B2 CLI version
+      - name: Show installed versions
         run: |
+          echo "FFmpeg:"
+          ffmpeg -version | head -n 1
+
+          echo "B2 CLI:"
           b2 version
 
       - name: Authorize Backblaze B2
@@ -40,10 +44,12 @@ jobs:
 
       - name: Check downloaded video
         run: |
-          echo "Downloaded video:"
+          echo "Downloaded file:"
           ls -lh input/video1.mp4
 
+          echo ""
           echo "Video information:"
+
           ffprobe \
             -v error \
             -show_entries format=duration,size \
@@ -67,28 +73,48 @@ jobs:
 
       - name: Check generated HLS files
         run: |
-          echo "Generated files:"
+          echo "========================================"
+          echo "Generated HLS files"
+          echo "========================================"
+
           ls -lh output/
 
-          echo "Playlist:"
+          echo ""
+          echo "========================================"
+          echo "Playlist contents"
+          echo "========================================"
+
           cat output/playlist.m3u8
 
       - name: Upload HLS files to B2
         run: |
+          echo "Uploading HLS files to Backblaze B2..."
+
           b2 sync \
             --no-progress \
             output/ \
             b2://my-stream-run/hls/video1/
 
-      - name: Verify uploaded files
+      - name: Verify uploaded HLS files
         run: |
-          echo "Uploaded HLS files:"
-          b2 ls my-stream-run hls/video1/
+          echo "========================================"
+          echo "Files uploaded to B2"
+          echo "========================================"
+
+          b2 ls --recursive \
+            b2://my-stream-run/hls/video1/
 
       - name: Finished
         run: |
+          echo ""
           echo "========================================"
-          echo "HLS processing completed successfully!"
+          echo "HLS PROCESSING COMPLETED"
           echo "========================================"
+          echo ""
           echo "Playlist:"
           echo "hls/video1/playlist.m3u8"
+          echo ""
+          echo "Segments:"
+          echo "hls/video1/segment_*.ts"
+          echo ""
+          echo "========================================"
