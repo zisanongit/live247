@@ -1,4 +1,4 @@
-name: Process Video to HLS
+name: Process All Videos to HLS
 
 on:
   workflow_dispatch:
@@ -8,7 +8,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -34,75 +33,152 @@ jobs:
         run: |
           b2 account authorize "$B2_KEY_ID" "$B2_APPLICATION_KEY"
 
-      - name: Download video from B2
+      - name: Find and process all videos
+        env:
+          B2_BUCKET: my-stream-run
         run: |
+          set -e
+
           mkdir -p input
 
-          b2 file download \
-            b2://my-stream-run/video1.mp4 \
-            input/video1.mp4
+          echo "========================================"
+          echo "Finding videos in B2"
+          echo "========================================"
 
-      - name: Check downloaded video
-        run: |
-          echo "Downloaded file:"
-          ls -lh input/video1.mp4
+          # Supported video formats:
+          # mp4, mkv, webm, mov, avi, wmv, m4v, mpeg, mpg, ts
+          b2 ls --recursive "b2://$B2_BUCKET/" > b2_files.txt
+
+          grep -Ei '\.(mp4|mkv|webm|mov|avi|wmv|m4v|mpeg|mpg|ts)$' b2_files.txt \
+            | grep -v '^hls/' \
+            | sed -E 's/^.*b2:\/\/[^/]+\///' \
+            > video_list.txt || true
 
           echo ""
-          echo "Video information:"
+          echo "Videos found:"
+          cat video_list.txt || true
+          echo ""
 
-          ffprobe \
-            -v error \
-            -show_entries format=duration,size \
-            -of default=noprint_wrappers=1 \
-            input/video1.mp4
+          if [ ! -s video_list.txt ]; then
+            echo "No supported video files found."
+            exit 0
+          fi
 
-      - name: Create HLS stream
-        run: |
-          mkdir -p output
+          VIDEO_INDEX=0
 
-          ffmpeg \
-            -i input/video1.mp4 \
-            -c:v copy \
-            -c:a aac \
-            -b:a 128k \
-            -f hls \
-            -hls_time 6 \
-            -hls_list_size 0 \
-            -hls_segment_filename "output/segment_%05d.ts" \
-            output/playlist.m3u8
+          while IFS= read -r B2_PATH; do
 
-      - name: Check generated HLS files
-        run: |
-          echo "========================================"
-          echo "Generated HLS files"
-          echo "========================================"
+            [ -z "$B2_PATH" ] && continue
 
-          ls -lh output/
+            VIDEO_INDEX=$((VIDEO_INDEX + 1))
+
+            FILENAME="$(basename "$B2_PATH")"
+            EXT="${FILENAME##*.}"
+            NAME="${FILENAME%.*}"
+
+            # Make a safe folder name.
+            SAFE_NAME="$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')"
+
+            # If filename becomes empty, use video number.
+            if [ -z "$SAFE_NAME" ]; then
+              SAFE_NAME="video${VIDEO_INDEX}"
+            fi
+
+            INPUT_FILE="input/${FILENAME}"
+            OUTPUT_DIR="output/${SAFE_NAME}"
+
+            echo ""
+            echo "========================================"
+            echo "Processing video #${VIDEO_INDEX}"
+            echo "File: ${FILENAME}"
+            echo "B2 path: ${B2_PATH}"
+            echo "Output: ${OUTPUT_DIR}"
+            echo "========================================"
+
+            rm -rf "$OUTPUT_DIR"
+            mkdir -p "$OUTPUT_DIR"
+
+            echo ""
+            echo "Downloading video..."
+
+            b2 file download \
+              "b2://$B2_BUCKET/$B2_PATH" \
+              "$INPUT_FILE"
+
+            echo ""
+            echo "Video information:"
+
+            ffprobe \
+              -v error \
+              -show_entries format=duration,size \
+              -of default=noprint_wrappers=1 \
+              "$INPUT_FILE"
+
+            echo ""
+            echo "Creating HLS..."
+
+            ffmpeg \
+              -y \
+              -i "$INPUT_FILE" \
+              -map 0:v:0 \
+              -map 0:a? \
+              -c:v copy \
+              -c:a aac \
+              -b:a 128k \
+              -f hls \
+              -hls_time 6 \
+              -hls_list_size 0 \
+              -hls_playlist_type vod \
+              -hls_segment_filename "${OUTPUT_DIR}/segment_%05d.ts" \
+              "${OUTPUT_DIR}/playlist.m3u8"
+
+            echo ""
+            echo "Generated HLS files:"
+            ls -lh "$OUTPUT_DIR"
+
+            echo ""
+            echo "Playlist:"
+            cat "${OUTPUT_DIR}/playlist.m3u8"
+
+            echo ""
+            echo "Removing local input file..."
+            rm -f "$INPUT_FILE"
+
+            echo ""
+            echo "Uploading HLS to B2..."
+
+            # Delete old HLS files for this video first.
+            b2 rm --recursive \
+              "b2://$B2_BUCKET/hls/$SAFE_NAME/" \
+              || true
+
+            # Upload new HLS files.
+            b2 sync \
+              --no-progress \
+              "$OUTPUT_DIR/" \
+              "b2://$B2_BUCKET/hls/$SAFE_NAME/"
+
+            echo ""
+            echo "Upload completed for ${FILENAME}"
+
+          done < video_list.txt
 
           echo ""
           echo "========================================"
-          echo "Playlist contents"
+          echo "ALL VIDEOS PROCESSED"
+          echo "Total videos: ${VIDEO_INDEX}"
           echo "========================================"
 
-          cat output/playlist.m3u8
-
-      - name: Upload HLS files to B2
-        run: |
-          echo "Uploading HLS files to Backblaze B2..."
-
-          b2 sync \
-            --no-progress \
-            output/ \
-            b2://my-stream-run/hls/video1/
-
-      - name: Verify uploaded HLS files
+      - name: Verify HLS folders
+        env:
+          B2_BUCKET: my-stream-run
         run: |
           echo "========================================"
-          echo "Files uploaded to B2"
+          echo "HLS files currently in B2"
           echo "========================================"
 
           b2 ls --recursive \
-            b2://my-stream-run/hls/video1/
+            "b2://$B2_BUCKET/hls/"
 
       - name: Finished
         run: |
@@ -111,10 +187,12 @@ jobs:
           echo "HLS PROCESSING COMPLETED"
           echo "========================================"
           echo ""
-          echo "Playlist:"
-          echo "hls/video1/playlist.m3u8"
+          echo "Every supported video was processed."
+          echo ""
+          echo "HLS folders:"
+          echo "hls/<video-name>/playlist.m3u8"
           echo ""
           echo "Segments:"
-          echo "hls/video1/segment_*.ts"
+          echo "hls/<video-name>/segment_*.ts"
           echo ""
           echo "========================================"
