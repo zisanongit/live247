@@ -19,6 +19,10 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install b2
 
+      - name: Show B2 CLI version
+        run: |
+          b2 version
+
       - name: Authorize Backblaze B2
         env:
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
@@ -36,8 +40,10 @@ jobs:
 
       - name: Check downloaded video
         run: |
+          echo "Downloaded video:"
           ls -lh input/video1.mp4
 
+          echo "Video information:"
           ffprobe \
             -v error \
             -show_entries format=duration,size \
@@ -59,22 +65,30 @@ jobs:
             -hls_segment_filename "output/segment_%05d.ts" \
             output/playlist.m3u8
 
-      - name: Show generated files
+      - name: Check generated HLS files
         run: |
-          echo "Generated HLS files:"
+          echo "Generated files:"
           ls -lh output/
 
-- name: Upload HLS files to B2
-  run: |
-    b2 sync \
-      --no-progress \
-      output/ \
-      b2://my-stream-run/hls/video1/
+          echo "Playlist:"
+          cat output/playlist.m3u8
+
+      - name: Upload HLS files to B2
+        run: |
+          b2 sync \
+            --no-progress \
+            output/ \
+            b2://my-stream-run/hls/video1/
+
+      - name: Verify uploaded files
+        run: |
+          echo "Uploaded HLS files:"
+          b2 ls my-stream-run hls/video1/
 
       - name: Finished
         run: |
-          echo "================================="
-          echo "HLS processing completed!"
-          echo "================================="
+          echo "========================================"
+          echo "HLS processing completed successfully!"
+          echo "========================================"
           echo "Playlist:"
           echo "hls/video1/playlist.m3u8"
