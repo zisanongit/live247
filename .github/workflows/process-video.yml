@@ -64,12 +64,12 @@ jobs:
           echo "Generated HLS files:"
           ls -lh output/
 
-      - name: Upload HLS files to B2
-        run: |
-          b2 sync \
-            --noProgress \
-            output/ \
-            b2://my-stream-run/hls/video1/
+- name: Upload HLS files to B2
+  run: |
+    b2 sync \
+      --no-progress \
+      output/ \
+      b2://my-stream-run/hls/video1/
 
       - name: Finished
         run: |
