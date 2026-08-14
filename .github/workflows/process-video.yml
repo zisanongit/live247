@@ -29,15 +29,17 @@ jobs:
       - name: Download video from B2
         run: |
           mkdir -p input
-          b2 file download-b2-file-by-name \
-            my-stream-run \
-            video1.mp4 \
+
+          b2 file download \
+            b2://my-stream-run/video1.mp4 \
             input/video1.mp4
 
       - name: Check downloaded video
         run: |
           ls -lh input/video1.mp4
-          ffprobe -v error \
+
+          ffprobe \
+            -v error \
             -show_entries format=duration,size \
             -of default=noprint_wrappers=1 \
             input/video1.mp4
