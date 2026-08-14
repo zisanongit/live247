@@ -1,198 +1,279 @@
-name: Process All Videos to HLS
+name: Process Videos to HLS
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  process:
+  process-videos:
     runs-on: ubuntu-latest
 
+    env:
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_BUCKET: my-stream-run
+
     steps:
+
+      # ---------------------------------------------------------
+      # 1. Checkout repository
+      # ---------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install FFmpeg and B2 CLI
+      # ---------------------------------------------------------
+      # 2. Install FFmpeg
+      # ---------------------------------------------------------
+      - name: Install FFmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          python3 -m pip install --upgrade pip
-          python3 -m pip install --upgrade b2
+          sudo apt-get install -y ffmpeg jq
 
-      - name: Show installed versions
+      # ---------------------------------------------------------
+      # 3. Install AWS CLI
+      # ---------------------------------------------------------
+      - name: Install AWS CLI
         run: |
-          echo "FFmpeg:"
-          ffmpeg -version | head -n 1
+          python3 -m pip install --upgrade awscli
 
-          echo "B2 CLI:"
-          b2 version
-
-      - name: Authorize Backblaze B2
-        env:
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      # ---------------------------------------------------------
+      # 4. Configure S3-compatible B2
+      # ---------------------------------------------------------
+      - name: Configure B2 credentials
         run: |
-          b2 account authorize "$B2_KEY_ID" "$B2_APPLICATION_KEY"
+          mkdir -p ~/.aws
 
-      - name: Find and process all videos
-        env:
-          B2_BUCKET: my-stream-run
+          cat > ~/.aws/credentials <<EOF
+          [default]
+          aws_access_key_id=${B2_KEY_ID}
+          aws_secret_access_key=${B2_APPLICATION_KEY}
+          EOF
+
+          cat > ~/.aws/config <<EOF
+          [default]
+          region=us-east-005
+          EOF
+
+      # ---------------------------------------------------------
+      # 5. Create processed database
+      # ---------------------------------------------------------
+      - name: Prepare processed database
         run: |
+          if [ ! -f processed-videos.json ]; then
+            echo '{}' > processed-videos.json
+          fi
+
+      # ---------------------------------------------------------
+      # 6. Find and process all supported videos
+      # ---------------------------------------------------------
+      - name: Process videos
+        shell: bash
+        run: |
+
           set -e
 
-          mkdir -p input
+          VIDEO_DIR="videos"
+          HLS_DIR="hls"
 
-          echo "========================================"
-          echo "Finding videos in B2"
-          echo "========================================"
+          mkdir -p "$HLS_DIR"
 
-          # Supported video formats:
-          # mp4, mkv, webm, mov, avi, wmv, m4v, mpeg, mpg, ts
-          b2 ls --recursive "b2://$B2_BUCKET/" > b2_files.txt
+          if [ ! -d "$VIDEO_DIR" ]; then
+            echo "No videos directory found."
+            exit 0
+          fi
 
-          grep -Ei '\.(mp4|mkv|webm|mov|avi|wmv|m4v|mpeg|mpg|ts)$' b2_files.txt \
-            | grep -v '^hls/' \
-            | sed -E 's/^.*b2:\/\/[^/]+\///' \
-            > video_list.txt || true
+          echo "Scanning videos directory..."
 
-          echo ""
-          echo "Videos found:"
-          cat video_list.txt || true
-          echo ""
+          find "$VIDEO_DIR" -type f \
+            \( \
+              -iname "*.mp4" \
+              -o -iname "*.mkv" \
+              -o -iname "*.mov" \
+              -o -iname "*.avi" \
+              -o -iname "*.webm" \
+              -o -iname "*.mpeg" \
+              -o -iname "*.mpg" \
+              -o -iname "*.m4v" \
+            \) \
+            -print0 > video-list.txt
 
-          if [ ! -s video_list.txt ]; then
+          if [ ! -s video-list.txt ]; then
             echo "No supported video files found."
             exit 0
           fi
 
-          VIDEO_INDEX=0
+          while IFS= read -r -d '' VIDEO; do
 
-          while IFS= read -r B2_PATH; do
+            echo ""
+            echo "========================================"
+            echo "Video: $VIDEO"
+            echo "========================================"
 
-            [ -z "$B2_PATH" ] && continue
+            BASENAME="$(basename "$VIDEO")"
+            NAME="${BASENAME%.*}"
 
-            VIDEO_INDEX=$((VIDEO_INDEX + 1))
+            # ---------------------------------------------------
+            # Sanitize folder name
+            # ---------------------------------------------------
+            SAFE_NAME="$(echo "$NAME" | \
+              tr '[:upper:]' '[:lower:]' | \
+              sed 's/[^a-z0-9._-]/_/g')"
 
-            FILENAME="$(basename "$B2_PATH")"
-            EXT="${FILENAME##*.}"
-            NAME="${FILENAME%.*}"
+            # ---------------------------------------------------
+            # Calculate SHA-256
+            # ---------------------------------------------------
+            HASH="$(sha256sum "$VIDEO" | awk '{print $1}')"
 
-            # Make a safe folder name.
-            SAFE_NAME="$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')"
+            SIZE="$(stat -c%s "$VIDEO")"
 
-            # If filename becomes empty, use video number.
-            if [ -z "$SAFE_NAME" ]; then
-              SAFE_NAME="video${VIDEO_INDEX}"
+            echo "Filename : $BASENAME"
+            echo "Size     : $SIZE bytes"
+            echo "SHA256   : $HASH"
+
+            # ---------------------------------------------------
+            # Check whether this exact video was already processed
+            # ---------------------------------------------------
+            EXISTING_HASH="$(jq -r \
+              --arg file "$BASENAME" \
+              '.[$file].sha256 // empty' \
+              processed-videos.json)"
+
+            EXISTING_SIZE="$(jq -r \
+              --arg file "$BASENAME" \
+              '.[$file].size // empty' \
+              processed-videos.json)"
+
+            if [ "$EXISTING_HASH" = "$HASH" ] && \
+               [ "$EXISTING_SIZE" = "$SIZE" ]; then
+
+              echo ""
+              echo ">>> SKIPPING"
+              echo "This exact video was already processed."
+              echo ""
+
+              continue
             fi
 
-            INPUT_FILE="input/${FILENAME}"
-            OUTPUT_DIR="output/${SAFE_NAME}"
-
             echo ""
-            echo "========================================"
-            echo "Processing video #${VIDEO_INDEX}"
-            echo "File: ${FILENAME}"
-            echo "B2 path: ${B2_PATH}"
-            echo "Output: ${OUTPUT_DIR}"
-            echo "========================================"
-
-            rm -rf "$OUTPUT_DIR"
-            mkdir -p "$OUTPUT_DIR"
-
+            echo ">>> NEW OR CHANGED VIDEO"
+            echo "Processing: $BASENAME"
             echo ""
-            echo "Downloading video..."
 
-            b2 file download \
-              "b2://$B2_BUCKET/$B2_PATH" \
-              "$INPUT_FILE"
+            # ---------------------------------------------------
+            # Output directory
+            # ---------------------------------------------------
+            OUTPUT="$HLS_DIR/$SAFE_NAME"
 
-            echo ""
-            echo "Video information:"
+            mkdir -p "$OUTPUT"
 
-            ffprobe \
-              -v error \
-              -show_entries format=duration,size \
-              -of default=noprint_wrappers=1 \
-              "$INPUT_FILE"
+            # ---------------------------------------------------
+            # Clean only this video's local output
+            # ---------------------------------------------------
+            rm -f "$OUTPUT"/*.ts
+            rm -f "$OUTPUT"/playlist.m3u8
 
-            echo ""
-            echo "Creating HLS..."
-
+            # ---------------------------------------------------
+            # Convert video to HLS
+            #
+            # Segment duration: approximately 6 seconds
+            # MPEG-TS output for maximum compatibility
+            # ---------------------------------------------------
             ffmpeg \
-              -y \
-              -i "$INPUT_FILE" \
+              -hide_banner \
+              -loglevel warning \
+              -i "$VIDEO" \
               -map 0:v:0 \
-              -map 0:a? \
-              -c:v copy \
+              -map 0:a:0? \
+              -c:v libx264 \
+              -preset veryfast \
+              -crf 23 \
               -c:a aac \
               -b:a 128k \
+              -ar 48000 \
               -f hls \
               -hls_time 6 \
-              -hls_list_size 0 \
               -hls_playlist_type vod \
-              -hls_segment_filename "${OUTPUT_DIR}/segment_%05d.ts" \
-              "${OUTPUT_DIR}/playlist.m3u8"
+              -hls_flags independent_segments \
+              -hls_segment_filename "$OUTPUT/segment_%05d.ts" \
+              "$OUTPUT/playlist.m3u8"
 
             echo ""
-            echo "Generated HLS files:"
-            ls -lh "$OUTPUT_DIR"
+            echo "HLS conversion completed."
+            echo ""
+
+            # ---------------------------------------------------
+            # Upload this video's HLS files to B2
+            # ---------------------------------------------------
+            echo "Uploading HLS files to Backblaze B2..."
+
+            aws s3 sync \
+              "$OUTPUT/" \
+              "s3://${B2_BUCKET}/hls/${SAFE_NAME}/" \
+              --endpoint-url "$B2_ENDPOINT" \
+              --only-show-errors
 
             echo ""
-            echo "Playlist:"
-            cat "${OUTPUT_DIR}/playlist.m3u8"
+            echo "Upload completed."
+
+            # ---------------------------------------------------
+            # Save processing information
+            # ---------------------------------------------------
+            TMP_JSON="$(mktemp)"
+
+            jq \
+              --arg file "$BASENAME" \
+              --arg hash "$HASH" \
+              --arg size "$SIZE" \
+              --arg folder "$SAFE_NAME" \
+              --arg processed "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+              '.[$file] = {
+                sha256: $hash,
+                size: ($size | tonumber),
+                hls_folder: $folder,
+                processed_at: $processed
+              }' \
+              processed-videos.json > "$TMP_JSON"
+
+            mv "$TMP_JSON" processed-videos.json
 
             echo ""
-            echo "Removing local input file..."
-            rm -f "$INPUT_FILE"
+            echo "Database updated for $BASENAME."
 
-            echo ""
-            echo "Uploading HLS to B2..."
+          done < video-list.txt
 
-            # Delete old HLS files for this video first.
-            b2 rm --recursive \
-              "b2://$B2_BUCKET/hls/$SAFE_NAME/" \
-              || true
-
-            # Upload new HLS files.
-            b2 sync \
-              --no-progress \
-              "$OUTPUT_DIR/" \
-              "b2://$B2_BUCKET/hls/$SAFE_NAME/"
-
-            echo ""
-            echo "Upload completed for ${FILENAME}"
-
-          done < video_list.txt
-
-          echo ""
-          echo "========================================"
-          echo "ALL VIDEOS PROCESSED"
-          echo "Total videos: ${VIDEO_INDEX}"
-          echo "========================================"
-
-      - name: Verify HLS folders
-        env:
-          B2_BUCKET: my-stream-run
+      # ---------------------------------------------------------
+      # 7. Commit processing database
+      # ---------------------------------------------------------
+      - name: Save processed database
         run: |
-          echo "========================================"
-          echo "HLS files currently in B2"
-          echo "========================================"
 
-          b2 ls --recursive \
-            "b2://$B2_BUCKET/hls/"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          git add processed-videos.json
+
+          if git diff --cached --quiet; then
+            echo "No database changes."
+          else
+            git commit -m "Update processed video database"
+            git push
+          fi
+
+      # ---------------------------------------------------------
+      # 8. Show final result
+      # ---------------------------------------------------------
       - name: Finished
         run: |
           echo ""
           echo "========================================"
-          echo "HLS PROCESSING COMPLETED"
+          echo "VIDEO PROCESSING COMPLETED"
           echo "========================================"
           echo ""
-          echo "Every supported video was processed."
+          echo "Previously processed videos were skipped."
+          echo "New/changed videos were converted to HLS."
           echo ""
-          echo "HLS folders:"
-          echo "hls/<video-name>/playlist.m3u8"
-          echo ""
-          echo "Segments:"
-          echo "hls/<video-name>/segment_*.ts"
-          echo ""
-          echo "========================================"
