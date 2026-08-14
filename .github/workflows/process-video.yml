@@ -1,4 +1,4 @@
-name: Process Live247 Video
+name: Process Video to HLS
 
 on:
   workflow_dispatch:
@@ -8,15 +8,71 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg and B2 CLI
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+          python3 -m pip install --upgrade pip
+          python3 -m pip install b2
 
-      - name: Check FFmpeg
+      - name: Authorize Backblaze B2
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
         run: |
-          ffmpeg -version
-          
+          b2 account authorize "$B2_KEY_ID" "$B2_APPLICATION_KEY"
+
+      - name: Download video from B2
+        run: |
+          mkdir -p input
+          b2 file download-b2-file-by-name \
+            my-stream-run \
+            video1.mp4 \
+            input/video1.mp4
+
+      - name: Check downloaded video
+        run: |
+          ls -lh input/video1.mp4
+          ffprobe -v error \
+            -show_entries format=duration,size \
+            -of default=noprint_wrappers=1 \
+            input/video1.mp4
+
+      - name: Create HLS stream
+        run: |
+          mkdir -p output
+
+          ffmpeg \
+            -i input/video1.mp4 \
+            -c:v copy \
+            -c:a aac \
+            -b:a 128k \
+            -f hls \
+            -hls_time 6 \
+            -hls_list_size 0 \
+            -hls_segment_filename "output/segment_%05d.ts" \
+            output/playlist.m3u8
+
+      - name: Show generated files
+        run: |
+          echo "Generated HLS files:"
+          ls -lh output/
+
+      - name: Upload HLS files to B2
+        run: |
+          b2 sync \
+            --noProgress \
+            output/ \
+            b2://my-stream-run/hls/video1/
+
+      - name: Finished
+        run: |
+          echo "================================="
+          echo "HLS processing completed!"
+          echo "================================="
+          echo "Playlist:"
+          echo "hls/video1/playlist.m3u8"
