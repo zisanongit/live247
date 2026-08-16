@@ -447,80 +447,40 @@ jobs:
 
           done < video-list.txt
 
-      # =========================================================
+         # =========================================================
       # 7. Save processed database
       # =========================================================
 
       - name: Save processed database
-
         shell: bash
-
         run: |
 
           set -e
 
           git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add processed-videos.json
-
-          if git diff --cached --quiet; then
-
-            echo "No database changes."
-
-            exit 0
-
-          fi
-
-          git commit \
-            -m "Update processed video database"
-
-          # -----------------------------------------------------
-          # Get latest remote changes
-          # -----------------------------------------------------
-
-          echo "Updating local branch from GitHub..."
+          echo "Fetching latest main..."
 
           git fetch origin main
+
+          # -----------------------------------------------------
+          # Rebase our workflow commit on the latest remote main
+          # -----------------------------------------------------
 
           git rebase origin/main
 
           # -----------------------------------------------------
-          # Push
+          # Check whether database changed
           # -----------------------------------------------------
+
+          if git diff --quiet HEAD~1 HEAD -- processed-videos.json; then
+            echo "No processed database changes."
+            exit 0
+          fi
 
           echo "Pushing processed database..."
 
           git push origin HEAD:main
 
           echo "Database pushed successfully."
-
-      # =========================================================
-      # 8. Final report
-      # =========================================================
-
-      - name: Finished
-
-        run: |
-
-          echo ""
-          echo "=================================================="
-          echo "VIDEO PROCESSING COMPLETED"
-          echo "=================================================="
-          echo ""
-
-          echo "Previously processed videos were skipped."
-
-          echo "New or changed videos were converted to HLS."
-
-          echo ""
-
-          echo "Processed database:"
-
-          cat processed-videos.json
-
-          echo ""
-
-          echo "Done."
