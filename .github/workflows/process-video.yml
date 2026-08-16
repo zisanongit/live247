@@ -18,34 +18,39 @@ jobs:
 
     steps:
 
-      # ---------------------------------------------------------
+      # =========================================================
       # 1. Checkout repository
-      # ---------------------------------------------------------
+      # =========================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ---------------------------------------------------------
-      # 2. Install FFmpeg
-      # ---------------------------------------------------------
-      - name: Install FFmpeg
+      # =========================================================
+      # 2. Install FFmpeg + jq
+      # =========================================================
+
+      - name: Install FFmpeg and jq
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg jq
 
-      # ---------------------------------------------------------
+      # =========================================================
       # 3. Install AWS CLI
-      # ---------------------------------------------------------
+      # =========================================================
+
       - name: Install AWS CLI
         run: |
           python3 -m pip install --upgrade awscli
 
-      # ---------------------------------------------------------
-      # 4. Configure S3-compatible B2
-      # ---------------------------------------------------------
+      # =========================================================
+      # 4. Configure B2
+      # =========================================================
+
       - name: Configure B2 credentials
         run: |
+
           mkdir -p ~/.aws
 
           cat > ~/.aws/credentials <<EOF
@@ -56,36 +61,51 @@ jobs:
 
           cat > ~/.aws/config <<EOF
           [default]
+          [profile default]
           region=us-east-005
           EOF
 
-      # ---------------------------------------------------------
-      # 5. Create processed database
-      # ---------------------------------------------------------
+      # =========================================================
+      # 5. Prepare processed database
+      # =========================================================
+
       - name: Prepare processed database
         run: |
+
           if [ ! -f processed-videos.json ]; then
             echo '{}' > processed-videos.json
           fi
 
-      # ---------------------------------------------------------
-      # 6. Find and process all supported videos
-      # ---------------------------------------------------------
+          echo "Current processed database:"
+          cat processed-videos.json
+
+      # =========================================================
+      # 6. Process ALL videos
+      # =========================================================
+
       - name: Process videos
         shell: bash
         run: |
 
-          set -e
+          set -euo pipefail
 
           VIDEO_DIR="videos"
           HLS_DIR="hls"
 
           mkdir -p "$HLS_DIR"
 
+          # -------------------------------------------------------
+          # Check videos directory
+          # -------------------------------------------------------
+
           if [ ! -d "$VIDEO_DIR" ]; then
-            echo "No videos directory found."
+            echo "videos directory does not exist."
             exit 0
           fi
+
+          # -------------------------------------------------------
+          # Find ALL supported videos
+          # -------------------------------------------------------
 
           echo "Scanning videos directory..."
 
@@ -102,90 +122,161 @@ jobs:
             \) \
             -print0 > video-list.txt
 
+          # -------------------------------------------------------
+          # Check whether videos exist
+          # -------------------------------------------------------
+
           if [ ! -s video-list.txt ]; then
-            echo "No supported video files found."
+
+            echo ""
+            echo "No supported videos found."
+            echo ""
+
             exit 0
+
           fi
+
+          echo ""
+          echo "Videos found:"
+          echo ""
+
+          while IFS= read -r -d '' VIDEO; do
+            echo " - $VIDEO"
+          done < video-list.txt
+
+          echo ""
+
+          # =======================================================
+          # Process every video one by one
+          # =======================================================
 
           while IFS= read -r -d '' VIDEO; do
 
             echo ""
-            echo "========================================"
-            echo "Video: $VIDEO"
-            echo "========================================"
+            echo "=================================================="
+            echo "Processing candidate:"
+            echo "$VIDEO"
+            echo "=================================================="
+
+            # -----------------------------------------------------
+            # Basic information
+            # -----------------------------------------------------
 
             BASENAME="$(basename "$VIDEO")"
+
             NAME="${BASENAME%.*}"
 
-            # ---------------------------------------------------
-            # Sanitize folder name
-            # ---------------------------------------------------
-            SAFE_NAME="$(echo "$NAME" | \
-              tr '[:upper:]' '[:lower:]' | \
-              sed 's/[^a-z0-9._-]/_/g')"
+            # -----------------------------------------------------
+            # Create safe folder name
+            # -----------------------------------------------------
 
-            # ---------------------------------------------------
-            # Calculate SHA-256
-            # ---------------------------------------------------
+            SAFE_NAME="$(
+              echo "$NAME" |
+              tr '[:upper:]' '[:lower:]' |
+              sed 's/[^a-z0-9._-]/_/g'
+            )"
+
+            if [ -z "$SAFE_NAME" ]; then
+              echo "Invalid video name. Skipping."
+              continue
+            fi
+
+            # -----------------------------------------------------
+            # Calculate SHA256
+            # -----------------------------------------------------
+
+            echo "Calculating SHA256..."
+
             HASH="$(sha256sum "$VIDEO" | awk '{print $1}')"
 
             SIZE="$(stat -c%s "$VIDEO")"
 
+            echo ""
             echo "Filename : $BASENAME"
             echo "Size     : $SIZE bytes"
             echo "SHA256   : $HASH"
+            echo "HLS      : hls/$SAFE_NAME/"
+            echo ""
 
-            # ---------------------------------------------------
-            # Check whether this exact video was already processed
-            # ---------------------------------------------------
-            EXISTING_HASH="$(jq -r \
-              --arg file "$BASENAME" \
-              '.[$file].sha256 // empty' \
-              processed-videos.json)"
+            # =====================================================
+            # CHECK DATABASE
+            # =====================================================
 
-            EXISTING_SIZE="$(jq -r \
-              --arg file "$BASENAME" \
-              '.[$file].size // empty' \
-              processed-videos.json)"
+            EXISTING_HASH="$(
+              jq -r \
+                --arg file "$BASENAME" \
+                '.[$file].sha256 // empty' \
+                processed-videos.json
+            )"
+
+            EXISTING_SIZE="$(
+              jq -r \
+                --arg file "$BASENAME" \
+                '.[$file].size // empty' \
+                processed-videos.json
+            )"
+
+            EXISTING_FOLDER="$(
+              jq -r \
+                --arg file "$BASENAME" \
+                '.[$file].hls_folder // empty' \
+                processed-videos.json
+            )"
+
+            # =====================================================
+            # ALREADY PROCESSED
+            # =====================================================
 
             if [ "$EXISTING_HASH" = "$HASH" ] && \
                [ "$EXISTING_SIZE" = "$SIZE" ]; then
 
               echo ""
-              echo ">>> SKIPPING"
-              echo "This exact video was already processed."
+              echo ">>> ALREADY PROCESSED"
+              echo ">>> Skipping: $BASENAME"
               echo ""
 
               continue
+
             fi
 
+            # =====================================================
+            # NEW OR CHANGED VIDEO
+            # =====================================================
+
             echo ""
-            echo ">>> NEW OR CHANGED VIDEO"
-            echo "Processing: $BASENAME"
+            echo ">>> NEW / CHANGED VIDEO"
+            echo ">>> Processing: $BASENAME"
             echo ""
 
-            # ---------------------------------------------------
+            # -----------------------------------------------------
             # Output directory
-            # ---------------------------------------------------
+            # -----------------------------------------------------
+
             OUTPUT="$HLS_DIR/$SAFE_NAME"
 
             mkdir -p "$OUTPUT"
 
-            # ---------------------------------------------------
-            # Clean only this video's local output
-            # ---------------------------------------------------
+            # -----------------------------------------------------
+            # Remove OLD local HLS for THIS video only
+            # -----------------------------------------------------
+
+            echo "Cleaning old local HLS files..."
+
             rm -f "$OUTPUT"/*.ts
             rm -f "$OUTPUT"/playlist.m3u8
 
-            # ---------------------------------------------------
-            # Convert video to HLS
-            #
-            # Segment duration: approximately 6 seconds
-            # MPEG-TS output for maximum compatibility
-            # ---------------------------------------------------
+            # =====================================================
+            # FFMPEG HLS CONVERSION
+            # =====================================================
+
+            echo ""
+            echo "Starting FFmpeg..."
+            echo ""
+
             ffmpeg \
               -hide_banner \
               -loglevel warning \
+              -y \
               -i "$VIDEO" \
               -map 0:v:0 \
               -map 0:a:0? \
@@ -203,13 +294,45 @@ jobs:
               "$OUTPUT/playlist.m3u8"
 
             echo ""
-            echo "HLS conversion completed."
+            echo "FFmpeg conversion completed."
             echo ""
 
-            # ---------------------------------------------------
-            # Upload this video's HLS files to B2
-            # ---------------------------------------------------
-            echo "Uploading HLS files to Backblaze B2..."
+            # =====================================================
+            # VERIFY HLS
+            # =====================================================
+
+            if [ ! -f "$OUTPUT/playlist.m3u8" ]; then
+
+              echo ""
+              echo "ERROR: playlist.m3u8 was not created."
+              exit 1
+
+            fi
+
+            SEGMENT_COUNT="$(
+              find "$OUTPUT" \
+                -type f \
+                -name "*.ts" |
+              wc -l
+            )"
+
+            echo "HLS segment count: $SEGMENT_COUNT"
+
+            if [ "$SEGMENT_COUNT" -eq 0 ]; then
+
+              echo ""
+              echo "ERROR: No HLS segments were created."
+              exit 1
+
+            fi
+
+            # =====================================================
+            # UPLOAD TO B2
+            # =====================================================
+
+            echo ""
+            echo "Uploading HLS to Backblaze B2..."
+            echo ""
 
             aws s3 sync \
               "$OUTPUT/" \
@@ -218,11 +341,17 @@ jobs:
               --only-show-errors
 
             echo ""
-            echo "Upload completed."
+            echo "B2 upload completed."
+            echo ""
 
-            # ---------------------------------------------------
-            # Save processing information
-            # ---------------------------------------------------
+            # =====================================================
+            # UPDATE DATABASE
+            # =====================================================
+
+            PROCESSED_TIME="$(
+              date -u +"%Y-%m-%dT%H:%M:%SZ"
+            )"
+
             TMP_JSON="$(mktemp)"
 
             jq \
@@ -230,25 +359,31 @@ jobs:
               --arg hash "$HASH" \
               --arg size "$SIZE" \
               --arg folder "$SAFE_NAME" \
-              --arg processed "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-              '.[$file] = {
+              --arg processed "$PROCESSED_TIME" \
+              '
+              .[$file] = {
                 sha256: $hash,
                 size: ($size | tonumber),
                 hls_folder: $folder,
                 processed_at: $processed
-              }' \
-              processed-videos.json > "$TMP_JSON"
+              }
+              ' \
+              processed-videos.json \
+              > "$TMP_JSON"
 
             mv "$TMP_JSON" processed-videos.json
 
             echo ""
-            echo "Database updated for $BASENAME."
+            echo "Database updated:"
+            echo "$BASENAME"
+            echo ""
 
           done < video-list.txt
 
-      # ---------------------------------------------------------
-      # 7. Commit processing database
-      # ---------------------------------------------------------
+      # =========================================================
+      # 7. Save processed database
+      # =========================================================
+
       - name: Save processed database
         run: |
 
@@ -258,22 +393,38 @@ jobs:
           git add processed-videos.json
 
           if git diff --cached --quiet; then
+
+            echo ""
             echo "No database changes."
+            echo ""
+
           else
+
             git commit -m "Update processed video database"
+
             git push
+
           fi
 
-      # ---------------------------------------------------------
-      # 8. Show final result
-      # ---------------------------------------------------------
+      # =========================================================
+      # 8. Final report
+      # =========================================================
+
       - name: Finished
         run: |
+
           echo ""
-          echo "========================================"
+          echo "=================================================="
           echo "VIDEO PROCESSING COMPLETED"
-          echo "========================================"
+          echo "=================================================="
           echo ""
-          echo "Previously processed videos were skipped."
+          echo "Already processed videos were skipped."
           echo "New/changed videos were converted to HLS."
+          echo "Each video has its own HLS folder."
+          echo ""
+          echo "HLS folders:"
+          find hls -maxdepth 2 -type f \
+            \( -name "playlist.m3u8" -o -name "*.ts" \) \
+            | sort \
+            | head -100
           echo ""
